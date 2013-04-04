@@ -1,0 +1,321 @@
+#!/usr/bin/perl
+
+# Public domain
+
+use GDBM_File;
+use Digest::SHA qw(sha256_hex);
+
+# minsubs is the minimum number of submissions that must exist
+# for a sid to be reported on.  After the first lab, it's useful
+# to set this to 2 so that spurious submissions are not shown.
+$minsubs = 1;
+
+select STDERR;
+$| = 1;
+select STDOUT;
+$| = 1;
+
+require "cgi-lib.pl";
+
+#print STDERR "scores.dat: hello\n";
+&ReadParse(*input);
+$showsids = defined($input{'sids'});
+$ontime = defined($input{'ontime'});
+$stricttime = 1;
+
+# Where are the user web areas?
+$wwwusers = '/var/www/pub/users';
+
+# Where are the keys and databases?
+$prefix = '/var/www/autograder';
+
+%emails = ();
+%digests = ();
+
+# Set class
+$class = 's21-f99';
+if (defined($input{'class'}) && $input{'class'} =~ /^[-_A-Za-z0-9]+$/ &&
+		-d $prefix . '/' . $input{'class'} ) {
+	$class = delete $input{'class'};
+}
+$prefix = $prefix . '/' . $class;
+
+# Set teacher
+$teacher ='stark';
+if (defined($input{'teacher'}) && $input{'teacher'} =~ /^[-_A-Za-z0-9 ,]+$/ &&
+		$input{'teacher'} !~ /^[ ,]/ && $input{'teacher'} !~ /[ ,]$/) {
+	$teacher = delete $input{'teacher'};
+	@mailtoP = split(/[, ]/, $teacher);
+	($mailtoP = $teacher) =~ s/ +/,/g;
+	$teacher = $mailtoP[0];
+}
+
+# gpath is the path to text score databases
+$gpath = '';
+if ($input{'gpath'} =~ /^[-\/.\w]+$/ && $input{'gpath'} !~ /\.\./) {
+	$gpath = delete $input{'gpath'};
+}
+# Assume that gpath is relative to teacher web area
+$gpath = $wwwusers . '/' . $teacher . '/' . $gpath;
+
+$cache = $prefix . '/scores-sids.html';
+
+if (-r $cache && open(SC, "<$cache")) {
+
+	while(<SC>) {
+		s/^\s+//; s/[\s\r\n]+$//;
+		next if (/^\#/);
+		if (/^SID/) {
+			@sorteddbs = split;
+			shift @sorteddbs; # remove first element "SID"
+		} elsif (/^(\d+)\s+(.*)$/) {
+			($key, $val) = ($1, $2);
+			#print STDERR "key: $key val: \"$val\"\n";
+			$s{$key} = join(":", split(/[ \t]+/, $val));
+		}
+	}
+	close(SC);
+
+} else {
+	#print STDERR "scores.dat: nocache, cd to $prefix\n";
+	chdir($prefix) || { &CgiError("chdir: $prefix: $!\n"), exit };
+	opendir(DIR, '.') || { &CgiError("opendir: $!\n"), exit };
+	foreach $arg (readdir(DIR)) {
+		next if -z $arg;
+		next if !($arg =~ s/\.db$//);
+		next if ($arg =~ /^grade/);
+		push(@databases, ($arg));
+		push(@NAscores, ('NaN'));
+		push(@INFtimes, (4294967296));
+		push(@elist, (''));
+	}
+
+	@sorteddbs = sort qcmp @databases;
+
+	$LOCK_EX = 2;
+	$LOCK_UN = 8;
+
+	$i = 0;
+	foreach $dbfile (@sorteddbs) {
+		$dbfile .= '.db';
+		open(DBLOCK, "+<$dbfile.lock") || {
+			&CgiError("open DBLOCK: ($dbfile.lock) $!\n"), exit
+		};
+		flock(DBLOCK, $LOCK_EX) || {
+			&CgiError("flock DBLOCK: $!\n"), exit
+		};
+		dbmopen(DB, $dbfile, 0666) || {
+			&CgiError("dbmopen DBLOCK: $!\n"), exit
+		};
+		while (($key, $val) = each %DB) {
+
+			# >>> k
+			# '23372917\t23372917'
+			# >>> db[k]
+			# '1359254709\t68.8\tSachal Nanda\tsnanda@berkeley.edu\t[169.229.76.204]\tseed%3D2337291723%26irGradeVersion%3D2013/1/26/1030%26submitTime%3DSat%20Jan%2026%202013%2018%3A45%3A08%20GMT-0800%20%28PST%29%26assignmentname%3Dreasoning-\t4'
+			# >>> db[k].split()
+			# ['1359254709', '68.8', 'Sachal', 'Nanda', 'snanda@berkeley.edu', '[169.229.76.204]', 'seed%3D2337291723%26irGradeVersion%3D2013/1/26/1030%26submitTime%3DSat%20Jan%2026%202013%2018%3A45%3A08%20GMT-0800%20%28PST%29%26assignmentname%3Dreasoning-', '4']
+
+			#print STDERR "scores.dat: $dbfile - $key, $val\n";
+			($sid, $passwd) = split("\t", $key);
+			next unless $sid =~ /^\w+$/;
+			next if ($sid =~ /^1234/);
+			($time,$score,$fullname,$email,$host,$extrainfo) = split("\t",$val);
+
+			# We store the email addresses for later
+			if (!defined($emails{$sid})) {
+				$emails{$sid} = $email;
+			}
+
+			# We create and store the digests for later
+			$digest = sha256_hex(lc($sid) . "," . lc($email));
+			if (!defined($digests{$sid})) {
+				$digests{$sid} = $digest;
+			}
+
+			if ($score =~ s/\(late\)//) {
+				$score = '-' . $score if $showsids;
+			}
+			$score =~ s/\s*//g;
+			$score .= ".0" unless $score =~ /\.[0-9]/;
+			$extra = '';
+			if ($extrainfo =~ /([-+])$/) {$extra = $1};
+			if (defined($s{$sid})) {
+				@scores = split(':', $s{$sid});
+			} else {
+				@scores = @NAscores;
+			}
+			if ($stricttime) {
+				if (defined($t{$sid})) {
+					@times = split(':', $t{$sid});
+				} else {
+					@times = @INFtimes;
+				}
+				if (defined($e{$sid})) {
+					@extras = split(':', $e{$sid});
+				} else {
+					@extras = @elist;
+				}
+				# if (($i >= 2 && $time < $times[$i]) || ($i < 2 && ($scores[$i] eq 'NaN' || $scores[$i] < $score))) 
+				$replace = 0;
+				if ($i < 2) {
+				  if ($scores[$i] eq 'NaN' || $scores[$i] < $score) {
+					$replace = 1;
+				  }
+				} elsif ($i == 10 || $i == 11 || $i == 16) {
+				  #print STDERR "i: $i sid $sid currentextra: $extra previousextra: $extras[$i] currentscore: $score previousscore: $scores[$i]\n";
+				  if ($extra eq $extras[$i] && $time < $times[$i]) {
+					# previous and current submission
+					# are in the same zone and current
+					# one occurred earlier
+					$replace = 1;
+				  } elsif ($extras[$i] eq '' && $extra ne '') {
+					# previous submission occured in zone 1
+					# current submission occured in zone 2
+					$replace = 1;
+				  } 
+				} else { # $i >=2 but not 10,11,16
+				  if ($time < $times[$i]) {
+					$replace = 1;
+				  }
+				}
+				$replace = 0 if ($ontime and ($score =~ /^-/));
+				if ($replace) {
+					$times[$i] = $time;
+					$scores[$i] = $score;
+					$extras[$i] = $extra;
+					$t{$sid} = join(':', @times);
+					$s{$sid} = join(':', @scores);
+					$e{$sid} = join(':', @extras);
+				}
+				undef @times;
+				undef @extras;
+			} else {
+				$scores[$i] = $score;
+				$s{$sid} = join(':', @scores);
+			}
+			undef @scores;
+			#print STDERR "scores.dat: s{$sid} = $s{$sid}\n";
+		}
+		dbmclose(DB);
+		undef %DB;
+		flock(DBLOCK, $LOCK_UN);
+		close(DBLOCK);
+		$i++;
+	}
+}
+
+undef @txtdbs;
+undef @NAscores;
+if (-d $gpath && chdir($gpath) && opendir(DIR, '.')) {
+	foreach $item (readdir(DIR)) {
+		next if ! -r "${gpath}/${item}";
+		next if -z _;
+		next if !($item =~ s/\.txt$//);
+		push(@txtdbs, $item);
+		push(@NAscores, ('NaN'));
+	}
+	closedir(DIR);
+}
+
+@sortedtdbs = sort qcmp @txtdbs;
+
+$i = 0;
+foreach $dbfile (@sortedtdbs) {
+	open(DBT, "<$dbfile".'.txt') || {&CgiError("open DBT: $!\n"), exit };
+	while(<DBT>) {
+		s/^\s+//; s/[\s\r\n]+$//;
+		next unless /./;
+		undef $key; undef $score; undef $junk;
+
+		# The .txt files under gpath switched to "," from " " in between
+		# S21/Su12/Grades/set22Adj.txt and C79/S13/Grades/quiz4.txt
+		($key, $score, $junk) = split(/[, \t]/);
+
+		if ($score !~ /^[\d.]+$/ || $junk ne '') {
+			#print STDERR "DBT $dbfile error: \"$sid\" \"$score\" \"$junk\"\n";
+			next;
+		}
+		if (defined($txt{$key})) {
+			@tscores = split(':', $txt{$key});
+			# take the higher score
+			if ($tscores[$i] eq 'NaN' || $tscores[$i] < $score) {
+				$tscores[$i] = $score;
+			}
+		} else {
+			@tscores = @NAscores;
+			$tscores[$i] = $score;
+		}
+		$txt{$key} = join(':', @tscores);
+		#print STDERR "txt{$sid} = $txt{$sid}\n";
+		undef @tscores;
+	}
+	close(DBT);
+	$i++;
+}
+
+# MAIN
+print "Content-type: text/html\n\n";
+print "#<PRE>\n";
+
+# Print the column headers
+#printf "%9.9s", "SID" if $showsids;
+# The sha256 digest hex is 64 chars
+if ($showsids) { printf "%64s", "KEY"; };
+
+foreach $dbfile (@sorteddbs) {
+	$dbfile =~ s/SticiGui//;
+	$dbfile =~ s/\..*//;
+	printf " %6.6s", $dbfile;
+}
+foreach $dbfile (@sortedtdbs) {
+	$dbfile =~ s/\..*//;
+	printf " %8.8s", $dbfile;
+}
+print "\n";
+
+# Data
+foreach $key (sort {$a <=> $b} (keys %s)) {
+	$value = $s{$key};
+	$subs = 0; $output = '';
+	# Enter the SID into the first column
+	if ($showsids) {
+		#$output = sprintf ("%9.9s\t%24s", $key, $email);
+		$digest = $digests{$key};
+		$output = sprintf ("%s", $digest);
+	}
+	foreach $score (split(":", $value)) {
+		$output .= sprintf(" %6.6s", $score);
+		if ($score =~ /\d/) { $subs++;}
+	}
+	if (defined($txt{$key})) {
+		@tscores = split(':', $txt{$key});
+		$txt{$key} = ''; # undef; use only once to check for extras
+	} else {
+		@tscores = @NAscores;
+	}
+	foreach $score (@tscores) {
+		$output .= sprintf(" %8.8s", $score);
+	}
+	undef @tscores;
+	if ($subs >= $minsubs) { print $output, "\n"; }
+}
+print "#</PRE>\n";
+
+# comparison of keys of the form ABC123***  with cmp,<=>,cmp
+sub qcmp {
+	local ($x, $y) = ($a, $b);
+	local ($x1, $x2, $x3, $y1, $y2, $y3, $result);
+
+	$x =~ /^(\D*)(\d*)(.*)$/;
+	$x1 = $1; $x2 = $2; $x3 = $3;
+	$y =~ /^(\D*)(\d*)(.*)$/;
+	$y1 = $1; $y2 = $2; $y3 = $3;
+
+	$result = ($x1 cmp $y1);
+	return $result unless $result == 0;
+	$result = ($x2 <=> $y2);
+	return $result unless $result == 0;
+	$result = ($x3 cmp $y3);
+	return $result;
+}

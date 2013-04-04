@@ -1,0 +1,791 @@
+#!/usr/bin/perl
+
+# Written originally by Ofer Licht.
+# Modified sporadically by Phil Spector.
+
+require "cgi-lib.pl";
+require "codec.pl";
+#use CGI qw(:cgi-lib :standard);
+use JSON qw( decode_json );
+use Time::Local;
+use GDBM_File;
+use POSIX;
+
+####
+#### Constants
+####
+
+if (defined($ENV{'TIME'})) {
+	# run from replay
+	$time = $ENV{'TIME'};
+	$pid = $ENV{'PID'};
+	$showhtmlerr = 0; # show html error when we die
+	$dooutput = 0; # do not produce html and mail output
+} else {
+	# run from cgi
+	$time=time;
+	$pid = $$;
+	$showhtmlerr = 1; # show html error when we die
+	$dooutput = 1; # produce html and mail output
+}
+
+$mailerrs = 'stark@stat.Berkeley.EDU';
+@mailtoP = ($mailerrs);
+$mailtoP = $mailerrs;
+# @mailtoE set later
+# $mailtoE set later
+
+# Where are the user web areas?
+$wwwusers = '/var/www/pub/users';
+
+# Where are the keys and databases?
+$prefix = '/var/www/autograder';
+
+$ANSWER_NA = -1;
+$ANSWER_INCORRECT = 0;
+$ANSWER_CORRECT = 1;
+
+$bad='';
+$sbad='';
+
+$defsolution=<<__EOT;
+<p>Report this problem and CheckCode_${pid}:${time} to 
+&lt;<A HREF="mailto:${mailerrs}?subject=CheckCode_${pid}:${time}">${mailerrs}</A>&gt;</p>
+__EOT
+
+$donesolution=<<__EOT;
+<p>If you believe the AutoGrader has made a mistake, ask 
+&lt;<A HREF="mailto:${mailerrs}?subject=CheckCode_${pid}:${time}">${mailerrs}</A>&gt;
+about CheckCode_${pid}:${time}.</p>
+__EOT
+
+$backsolution=<<'__EOT';
+<p>Return to the page with the form, enter the required information,
+and resubmit the form.</p>
+__EOT
+
+$backsolution .= $donesolution;
+
+$errorhead = <<'__EOT';
+<html><head><title>Autograder Processing Error</title></head>
+<body><h1 align="center"><font color="red">Autograder Processing Error</font></h1><p>An error occurred during submission.</p><h2><font color="red">Problem:</font></h2>
+__EOT
+
+$errormid = '<h2><font color="green">Solution:</font></h2>';
+$errortail = "</body></html>";
+
+$logstr='';
+
+####
+#### Subroutines
+####
+
+sub dolog {
+	$logstr .= shift;
+}
+
+sub htime {
+	local ($t) = @_;
+	($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($t);
+
+	# sec, min, hour, mday, mon, year
+	$str = POSIX::strftime("%c", $sec, $min, $hour, $mday, $mon, $year);
+
+	return $str;
+}
+
+sub Die {
+	local ($problem, $solution, $garbage) = @_;
+	$problem = '<p>Unknown</p>' unless $problem;
+	$solution = $defsolution unless $solution;
+	if ($showhtmlerr) {
+		print &PrintHeader;
+		print $errorhead, "\n",
+			$problem,   "\n",
+			$errormid,  "\n",
+			$solution,  "\n",
+			$errortail, "\n";
+	}
+	# do not log multi-line problems.
+	if ($problem =~ /\n/) {
+		$problem = '';
+	} else {
+		$problem = " ($problem)";
+	}
+	die("AutoGrader: ${pid}:${time}:$ENV{'REMOTE_HOST'}[$ENV{'REMOTE_ADDR'}]:$ENV{'HTTP_USER_AGENT'} ${sbad}${problem} $input\n");
+}
+
+sub checkAnswer {
+	local ($answer, $sanswer, $garbage) = @_;
+	local $one;
+	local $four;
+	local ($right) = 0;
+
+	if ($sanswer =~ /^(-?(\d+\.?\d*|\d*\.?\d+)(|[eEdD][- +]?\d+))$/) {
+		$sanswer =~ s/ //;
+	}
+
+# java number->string conversions were putting a blank between the "e" and
+# the exponent values -  So I check for $sanswer being a number, and if it
+# is I remove the blank.  Then I check the $answer in the same way.
+	
+#	if ($answer =~ /^(-?(\d+\.?\d*|\d*\.?\d+)(|[eE][-+]?\d+)):(-?(\d+\.?\d*|\d*\.?\d+)(|[eE][-+]?\d+))$/ ) { # range
+	if ($answer =~ /^(-?(\d+\.?\d*|\d*\.?\d+)(|[eEdD][- +]?\d+)):(-?(\d+\.?\d*|\d*\.?\d+)(|[eEdD][- +]?\d+))$/ ) { # range
+		dolog("range ");
+		$one = $1;
+		$four = $4;
+		$one =~ s/ //;
+		$four =~ s/ //;
+		if ($sanswer ne '' && $one <= $sanswer && $sanswer <= $four) {
+			$right++;
+		}
+	} elsif ($answer =~ /^-?(\d+\.?\d*|\d*\.?\d+)(|[eEdD][ -+]?\d+)$/) {
+		# number?
+		$answer =~ s/ //;
+		dolog("numeric ");
+		if ($sanswer ne '' && $answer == $sanswer) {
+			$right++;
+		}
+	} elsif ($answer eq '*') {	# wildcard
+		dolog("wildcard ");
+		if ($sanswer ne "") {
+			$right++;
+		}
+	} elsif ($answer eq '?') {	# no grade
+		dolog("no grade ");
+		return($ANSWER_NA);
+	} else {
+		# strings
+		if ($answer =~ /[;&]/) {
+			# multiple strings
+			dolog("multiple ");
+			# sort lists before comparison
+			$answer=join(';', sort(split(/[;&]/, $answer)));
+			$sanswer=join(';', sort(split(/[&]/, $sanswer)));
+		} else {
+			dolog("string ");
+		}
+		if ("\L$answer\E" eq "\L$sanswer\E") {
+			$right++;
+		}
+	}
+
+	if ($right) {
+		dolog("<OK> ");
+	} else {
+		dolog("<NO> ");
+	}
+	
+	$right; # return
+}
+
+# absolute value
+
+sub abs {
+	local ($x, $y) = @_;
+	local ($result) = 0 + $x - $y;
+	$result < 0 ? 0 - $result : $result;
+}
+
+# comparison of keys of the form ABC123***  with cmp,<=>,cmp
+sub qcmp {
+	local ($x, $y) = ($a, $b);
+	local ($x1, $x2, $x3, $y1, $y2, $y3, $result);
+
+	$x =~ /^(\D*)(\d*)(.*)$/;
+	$x1 = $1; $x2 = $2; $x3 = $3;
+	$y =~ /^(\D*)(\d*)(.*)$/;
+	$y1 = $1; $y2 = $2; $y3 = $3;
+
+	$result = ($x1 cmp $y1);
+	return $result unless $result == 0;
+	$result = ($x2 <=> $y2);
+	return $result unless $result == 0;
+	$result = ($x3 cmp $y3);
+	return $result;
+}
+
+# look for duedate in duefile.  file format "name mm/dd/yyyy hh:mm:ss"
+# if it cannot read the duefile, returns -2;
+# if it cannot find name in duefile, returns -1;
+# otherwise returns a unix time integer.
+sub oldqueryduefile {
+	local ($duefile, $name) = @_;
+	local ($one, $two, $three, $duedate);
+
+	$duedate=-1;
+	open(DUE,"<$duefile") || return -2;
+	while(<DUE>) {
+		chop;
+		s/ /0/g;
+		$_ = &codec($_, $Saintscode);
+		($one, $two, $three, $four) = split;
+		next unless $name eq $one;
+		$duedate = &datetoutime($two, $three);
+		last;
+	}
+	close(DUE);
+	$duedate;
+}
+
+sub queryduefile {
+	local ($duefile, $name) = @_;
+	local ($one, $two, $three, $duedate);
+
+	$duedate=-1;
+
+	$json = ""; $buffer = "";
+	open(DUE,"<$duefile") || return -2;
+	while(<DUE>) {
+		chomp;
+		$json .= $_;
+	}
+	close(DUE);
+
+	@decoded = decode_json($json);
+	$i = 0;
+	print $n, "\n";
+	while (1) {
+		$entry = $decoded[0][$i];
+		$assignment = $entry->[0];
+		$dt = $entry->[1];
+		last if ($name eq $assignment);
+		$i += 1;
+		print "$i\n";
+	}
+	($d, $t, $z) = split(/ +/, $dt, 3);
+	#printf("%s %s\n", $d, $t);
+	return &datetoutime($d, $t);
+}
+# convert mm/dd/yyyy hh:mm:ss into unix time integer.
+sub datetoutime {
+	local ($date, $clock) = @_;
+	local ($month, $day, $year, $hour, $min, $sec) = (0,0,0,0,0,0);
+	local ($utime);
+
+	($month, $day, $year) = split("/", $date);
+	# XXX Y2K: after 2038 unix time overflows int!
+	# we assume a 2 digit year for now.
+	if ($year > 1900) { $year -= 1900; }
+	($hour, $min, $sec) = split(":", $clock) unless $clock eq '';
+	$utime = timelocal($sec, $min, $hour, $day, $month - 1, $year);
+}	
+
+####
+#### START
+####
+
+$PIcode='3141592653';
+$Saintscode = 'WhenTheSaintsComeMarchingIn';
+if (&ReadParse(*rawinput) && defined($rawinput{'contents'})) { # no input
+	$ENV{'REQUEST_METHOD'} = 'GET';
+	$ENV{'QUERY_STRING'} = &codec($rawinput{'contents'}, $PIcode);
+} else {
+	Die('This script can only be used to decode form results.(raw)');
+}
+
+if (!&ReadParse(*input)) { # no input
+	Die('This script can only be used to decode form results.(inp)');
+}
+
+# All the key,value pairs are now in the hash %input
+# All the key=value strings are now in the array @input
+# The original QUERY_STRING is in $input
+
+# FORMNAME (REQUIRED)
+
+if (defined($input{'formname'}) && $input{'formname'} =~ /[-_A-Za-z0-9]+$/) {
+	$formname = delete $input{'formname'};
+} else {
+	open(FOO,">>/tmp/r.log");
+	printf(FOO "input: %s\n", $input);
+	close(FOO);
+	$m = sprintf("Bad or missing formname: '%s'", $input{'formname'});
+	Die($m);
+}
+
+# CLASS (REQUIRED)
+
+if (defined($input{'class'}) && $input{'class'} =~ /^[-_A-Za-z0-9]+$/ &&
+	 -d $prefix . '/' . $input{'class'} ) {
+	$class = delete $input{'class'};
+	$prefix .= '/' . $class;
+} else {
+	#print &PrintHeader;
+	$m = sprintf("Bad or missing class: '%s'; prefix=%s<br/>",
+		$input{'class'}, $prefix);
+	Die($m);
+}
+
+# TEACHER (REQUIRED)
+
+if (defined($input{'teacher'}) && $input{'teacher'} =~ /^[-_A-Za-z0-9 ,]+$/ &&
+	$input{'teacher'} !~ /^[ ,]/ && $input{'teacher'} !~ /[ ,]$/) {
+	$teacher = delete $input{'teacher'};
+	@mailtoP = split(/[, ]/, $teacher);
+	($mailtoP = $teacher) =~ s/ +/,/g;
+	$teacher = $mailtoP[0];
+} else {
+	Die('Bad or missing teacher');
+}
+
+# SID (REQUIRED)
+#  Valid if all digits, 
+#   and either length8 begining with 1, or length9 (ssn?)
+
+$sbad .= ";sid1=\"$input{'sid'}\"";
+
+# Start - 20130123
+# The non-matriculated students have short "SIDs" that start with a letter.
+# Please change the test so that it only checks whether the SID is
+# alphanumeric (no special characters).
+if (defined($input{'sid'}) && $input{'sid'} =~ /^\w+$/) {
+	$sid = delete $input{'sid'};
+} else {
+	$bad .= "<p>The Student Identification number (SID) was not valid.</p>\n";
+	$sbad .= "(BAD)";
+}
+
+# SID2 (REQUIRED)
+
+$sbad .= ";sid2=\"$input{'sid2'}\"";
+if (defined($input{'sid2'}) && $input{'sid2'} == $sid) {
+	delete $input{'sid2'};
+} else {
+	$bad .= "<p>The two Student Identification numbers (SID) did not agree.</p>\n";
+	$sbad .= "(BAD)";
+}
+
+# PASSWD (REQUIRED)
+#  cannot contain tabs or newlines
+
+$sbad .= ";pw=\"$input{'passwd'}\"";
+if (defined($input{'passwd'}) && $input{'passwd'} !~ /[\t\n]/ && $input{'passwd'} ne '') {
+	$passwd = delete $input{'passwd'};
+} else {
+	$bad .= "<p>The PASSWORD was not valid.</p>\n";
+	$sbad .= "(BAD)";
+}
+
+# PASSWD2 (REQUIRED)
+
+$sbad .= ";pw2=\"$input{'passwd2'}\"";
+if (defined($input{'passwd2'}) && $input{'passwd2'} eq $passwd) {
+	delete $input{'passwd2'};
+} else {
+	$bad .= "<p>The two PASSWORDS did not agree.</p>\n";
+	$sbad .= "(BAD)";
+}
+
+# FIRSTNAME (REQUIRED)
+
+$sbad .= ";fname=\"$input{'firstName'}\"";
+if (defined($input{'firstName'}) &&
+	$input{'firstName'} =~ /^[-A-Za-z]+[-A-Za-z ]*$/) {
+	$firstName = delete $input{'firstName'};
+} else {
+	$bad .= "<p>The FIRST NAME was not valid.</p>\n";
+	$sbad .= "(BAD)";
+}
+
+# LASTNAME (REQUIRED)
+
+$sbad .= ";lname=\"$input{'lastName'}\"";
+if (defined($input{'lastName'}) &&
+	$input{'lastName'} =~ /^[-A-Za-z]+[-A-Za-z ]*$/) {
+	$lastName = delete $input{'lastName'};
+} else {
+	$bad .= "<p>The LAST NAME was not valid.</p>\n";
+	$sbad .= "(BAD)";
+}
+
+$fullname = $firstName . ' ' . $lastName;
+
+# EMAIL (REQUIRED)
+
+$sbad .= ";email=\"$input{'email'}\"";
+if (defined($input{'email'}) && 
+	$input{'email'} =~ /^[-.,:%\w]+\@[-.\w]+\.[A-Za-z]{2,3}$/ ) {
+	$email = delete $input{'email'};
+} else {
+	$bad .= "<p>The EMAIL address was not valid.</p>\n";
+	$sbad .= "(BAD)";
+}
+
+# Stop to report back errors
+
+if ($bad ne '') {
+	Die($bad, $backsolution);
+}
+
+# Check our files
+
+$logfile = "${prefix}/${formname}.log";
+$dbfile = "${prefix}/${formname}.db";
+$summary = "${prefix}/${formname}.sum";
+
+if (! -w $logfile) {
+	Die("log $logfile not ready");
+}
+# if (! -w "${dbfile}.lock" || ! -w "${dbfile}.pag" || ! -w "${dbfile}.dir") {
+if (! -w "${dbfile}.lock") {
+	Die("DB $dbfile not ready");
+}
+# if (! -w "${summary}.pag" || ! -w "${summary}.dir") {
+if (! -w "${summary}") {
+	Die("SUMMARY $summary not ready");
+}
+
+$duedate=-1;
+$late='';
+
+# EXTRAINFO (OPTIONAL)
+#  cannot contain tabs or newlines
+
+$sbad .= ";pw=\"$input{'extrainfo'}\"";
+if (defined($input{'extrainfo'}) && $input{'extrainfo'} !~ /[\t\n]/) {
+	$extrainfo = delete $input{'extrainfo'};
+} else {
+	$extrainfo = '';
+}
+
+# DFILE (OPTIONAL) duedate filename
+
+if (defined($input{'dFile'})) {
+	$chkdFile = $input{'dFile'};
+	@dots = ($chkdFile =~ /\.\./g);
+	$nddots = scalar @dots;
+	if ($input{'dFile'} =~ /^[-\/.\w]+$/ && ($input{'dFile'} !~ /\.\./ || ($input{'dFile'} =~ /^\.\.\/stark\// && $nddots <= 1))) {
+		$duefile = delete $input{'dFile'};
+		# assume that duefile is relative to teacher web area
+		$duedate = &queryduefile("$wwwusers/$teacher/$duefile", $formname);
+		if ($duedate > 0) {
+			$late='(late)' if $time > $duedate;
+			dolog("duedate: $duefile>> [$duedate] $late\n");
+		} else {
+			# no duedate in file is OK
+			$duedate = -1;  # it could have been -2
+		}
+	} else {
+		Die('Bad duefile');
+	}
+}
+
+#   Maxsubmits (optional)
+$maxSubmits = 5;
+if (defined($input{'maxSubmits'})) {
+	if ($input{'maxSubmits'} > 0) {
+		$maxSubmits = delete $input{'maxSubmits'};
+	}
+}
+
+$showWrongAfterSubmits = 10000;
+if (defined($input{'showWrongAfterSubmits'})) {
+	if ($input{'showWrongAfterSubmits'} >= 0) {
+		$showWrongAfterSubmits = delete $input{'showWrongAfterSubmits'};
+	}
+}
+
+$num_questions=0;
+$numright=0;
+$num_points=0;
+$score=0;
+$num_not_graded = 0;
+
+if (defined($input{'inlinekey'})) {
+
+	# INLINEKEY (OPTIONAL) QQQQ#:aaaa#:nnn
+	# results in hash of answers and points keyed on questions
+
+	$inlinekey = delete $input{'inlinekey'};
+	if ($inlinekey =~ /^([A-Za-z]+)#:([A-Za-z]+)#:([1-9]\d*)$/) {
+		$inlineQ = $1;
+		$inlineA = $2;
+		$inlineN = $3;
+		# Answer and question pattern cannot be equal
+		if ($1 eq $2) { Die('Corrupted Form (QApat)'); }
+		while (($akey, $aval) = each %input) {
+		  if ($akey =~ /^$inlineA(\w+)$/o) {
+			$akeys{$inlineQ . $1} = $akey;
+			$answers{$inlineQ . $1} = delete $input{$akey};
+			# XXX for now, inline points are all 1
+			$points{$inlineQ . $1} = 1;
+			$num_questions += 1;
+			$num_points += 1;
+		  }
+		}
+		if ($num_questions < 1 || $num_questions != $inlineN) {
+			$m = sprintf("Corrupted Form (maxnum=%s %s:%s:%s) %s",
+				$inlineQ, $inlineA, $inlineN, $num_questions, $input);
+			Die($m);
+		}
+	} else {
+		Die('Corrupted Form');
+	}
+
+} else {
+
+	# KEYFILE
+	# keyfile has form Questionname\tAnswer\tPointvalue
+	# and may contain duedate line in form due\tmm/dd/yyyy\thh:mm:ss	
+	# results in hash of answers and points keyed on questions.
+	# Careful: some values may override inline stuff from above.
+
+	$keyfile = "${prefix}/${formname}.key";
+	open(KEY,"<$keyfile") || Die("keyfile not ready");
+	while(<KEY>) {
+		chop;
+		next if /^#/; # comments
+		($question, $answer, $point) = split("\t");
+
+		# Duedate
+		if ($question =~ /^due/) {
+			$duedate = datatoutime($answer, $point);
+			$late='(late)' if $duedate > 0 && $time > $duedate;
+			dolog("duedate: $answer $point [$duedate] $late\n");
+			next;
+		}
+		$point = 1 unless $point > 1;
+		$num_questions += 1;
+		$num_points += $point;
+		$points{$question} = $point;
+
+		# redirect to answer in hidden field?
+		$hanswer='';
+		if ($answer =~ /^#([^#].*)$/) { 
+			$hanswer=$1;
+			if ($hanswer ne $question && defined($input{$hanswer})) {
+				$answer = delete $input{$hanswer};
+			}
+		}
+		$answers{$question} = $answer;
+	 }
+	 close(KEY);
+}
+
+# loop over answers and questions
+
+@wrong = ();
+foreach $question (sort qcmp (keys %answers)) {
+	$answer = $answers{$question};
+
+	# we could easily do a "next" if the student did not answer,
+	# but we don't because we want to do full logging.
+	if (defined($input{$question})) {
+		# clean student answer
+		$sanswer = delete $input{$question};
+		# convert multiple answers into ampersand list
+		$sanswer =~ s/\0/\&/g;
+		# strip leading and trailing whitespace
+		$sanswer =~ s/^[\s]*(.*)[\s]*$/$1/;
+		# t-t-t-ty-p-p-pers?
+		$sanswer =~ s/[.]+/./g;
+		# strip commas (mostly for sake of big numbers)
+		if ($sanswer =~ /^[.\d,]+$/) {
+			$sanswer =~ s/,//g;
+		}
+		# convert ratios to decimal
+		if ($sanswer =~ /^(-?[.\d]+)[\s]*([\/\\:]|to)[\s]*(-?[.\d]+)/) {
+			$sanswer = $1 / $3 unless $3==0;
+		}
+		# percentages
+		if ($sanswer =~ /[%]$/) {
+			$sanswer =~ s/[%]+$//;
+			$sanswer = $sanswer / 100;
+		}
+	} else {
+		$sanswer='';
+	}
+
+	dolog("${question}: $answer ($points{$question} pts); ");
+
+	# pipe symbol (|) divides multiple correct answers.
+	@parts = split(/\|+/, $answer);
+	@sparts = split(/[&]/, $sanswer);
+
+	$result = $ANSWER_INCORRECT;
+
+	if ((scalar @sparts > 1) and (scalar @parts > 1)) {
+		dolog('newtest ');
+		$result = $ANSWER_CORRECT;
+		foreach $s (@sparts) {
+			$gotit = 0;
+			foreach $p (@parts) {
+				$gotit = 1 if $s eq $p;
+			}
+			$result = $ANSWER_INCORRECT if $gotit != 1;
+		}
+		if ($result) {
+			dolog("<OK> ");
+		} else {
+			dolog("<NO> ");
+		}
+	} else {
+
+		foreach $a (split(/\|+/, $answer)) {
+			$c = checkAnswer($a, $sanswer);
+			if ($c == $ANSWER_CORRECT || $c == $ANSWER_NA) {
+				$result = $c;
+				last;
+			}
+		}
+	}
+	if ($result == $ANSWER_CORRECT) {
+		$numright++;
+		$score += $points{$question};
+		$indicator{$question}=1;
+	} elsif ($result == $ANSWER_INCORRECT) {
+		push(@wrong, $question);
+	} else {
+		$num_not_graded += 1;
+	}
+
+	dolog("\"$sanswer\" ");
+	# save student answer
+	$student{$question} = "\"$sanswer\"";
+	dolog("$numright/$num_questions, $score/$num_points\n");
+}
+
+$num_graded = $num_questions - $num_not_graded;
+$score_graded = $num_points - $num_not_graded;
+
+if ($score_graded > 0) {
+	$percent = 100 * $score / $score_graded;
+} else {
+	$percent = 0;
+}
+# round to tenths place
+$percent = (int(10*$percent + .5))/10;
+$wrongs = sprintf("@wrong");
+
+# locking constants
+
+$LOCK_EX = 2;
+$LOCK_UN = 8;
+
+##################################################
+# Local Logging 
+##################################################
+$human_time = htime($time);
+open(LOG,">>$logfile") || Die("logfile $logfile: $!");
+flock(LOG, $LOCK_EX) || Die("loglock $logfile: $!");
+# go to the end
+seek(LOG, 0, 2);
+print LOG "-+-+-+\n";
+print LOG <<__EOT;
+ PID: $$
+ Time: $time $late
+ Human Time: $human_time
+ ============================================================
+ REMOTE HOST:       $ENV{'REMOTE_HOST'}\[$ENV{'REMOTE_ADDR'}\]
+ HTTP_USER_AGENT:   $ENV{'HTTP_USER_AGENT'}
+ QUERY_STRING:      $input
+ ============================================================
+ SID:               $sid
+ Password:          $passwd
+ lastName:          $lastName
+ firstName:         $firstName
+ Email:             $email
+ Teacher:           $mailtoP
+ Assignment:        $formname
+ Correct answers:   $numright / $num_graded
+ Score:             $score / $score_graded = $percent\%
+ ExtraInfo:         $extrainfo
+ Not graded:        $num_not_graded
+ ============================================================
+__EOT
+print LOG $logstr, "\n";
+print LOG "+-+-+-\n";
+flock(LOG, $LOCK_UN);
+close(LOG);
+
+##################################################
+# Enter data into DB
+##################################################
+
+open(DBLOCK,"+<$dbfile.lock") || Die("open dblock $dbfile.lock: $!");
+flock(DBLOCK, $LOCK_EX) || Die("lock dblock $dbfile.lock: $!");
+dbmopen(DB, $dbfile,0666) || Die("dbmopen $dbfile: $!");
+dbmopen(SUMMARY, $summary,0666) || Die("dbmopen $summary: $!");
+
+$key = $sid . "\t" . $passwd;
+$lastnsub = 0;
+if (defined($DB{$key})) {
+	($lasttime, $lastscore, $lastfullname, $lastemail, $lasthost, $lastextra, $lastnsub) = split("\t", $DB{$key});
+	if ($lastnsub >= $maxSubmits) { 
+		dbmclose(DB);
+		flock(DBLOCK, $LOCK_UN);
+		close(DBLOCK);
+		undef %indicator;
+		$msg = '';
+		if ($maxSubmits > 0) {
+			$msg = " the maximum of $maxSubmits times";
+		}
+		Die("SID ${sid} already turned in ${formname}$msg.", $donesolution);
+	}
+}
+$lastnsub += 1;
+$DB{$key} = join("\t", $time, $percent . $late, $fullname, $email,
+	$ENV{'REMOTE_HOST'} . '[' . $ENV{'REMOTE_ADDR'} . ']',
+	$extrainfo . '-', $lastnsub) if $late eq '';
+dbmclose(DB);
+
+$SUMMARY{'_ToTaL_'}++;
+foreach $q (keys %indicator) {
+	$SUMMARY{$q} += $indicator{$q};
+}
+dbmclose(SUMMARY);
+
+flock(DBLOCK, $LOCK_UN);
+close(DBLOCK);
+
+# replayer exits here
+exit(0) unless $dooutput;
+
+$msg = "";
+if ($maxSubmits > 1) {
+	$msg = " ($lastnsub of a maximum of $maxSubmits)";
+}
+
+##################################################
+# Respond to student's browser
+##################################################
+
+$prwrong = "";
+if ($lastnsub >= $showWrongAfterSubmits) {
+	$prwrong = "Incorrect:        $wrongs";
+}
+
+print <<__EOT;
+Content-type: text/html
+
+<HTML><HEAD><TITLE>AutoGrader</TITLE></HEAD>
+<BODY>
+<H1>AutoGrader</H1>
+<PRE>
+ ============================================================
+ SID:               $sid
+ Name:              $fullname
+ Assignment:        $formname
+ Correct answers:   $numright / $num_graded
+ Score:             $score / $num_points = $percent\%
+ $prwrong
+ ============================================================
+
+ This assignment has $num_questions questions, of which $num_graded
+ are graded by machine and $num_not_graded are graded by hand.
+
+ Your score on the machine-graded questions is $score. Your score on
+ the hand-graded questions will be reported elsewhere.
+
+ Your submission${msg} has been received.
+__EOT
+
+if ($duedate > 0 && $time > $duedate) {
+	print <<__EOT;
+ Note: Your submission is late!  Your instructor may or may not
+ count the score towards your class grade.
+__EOT
+}
+
+print "</PRE></BODY></HTML>";
