@@ -1,6 +1,9 @@
 #!/usr/bin/perl
 
 # Public domain
+# Originally written by Ofer Licht
+# Maintained by Phil Spector
+# Patched by Ryan Lovett
 
 use GDBM_File;
 use Digest::SHA qw(sha256_hex);
@@ -31,6 +34,7 @@ $prefix = '/var/www/autograder';
 
 %emails = ();
 %digests = ();
+%delimitedScores = ();
 
 # Set class
 $class = 's21-f99';
@@ -71,7 +75,7 @@ if (-r $cache && open(SC, "<$cache")) {
 		} elsif (/^(\d+)\s+(.*)$/) {
 			($key, $val) = ($1, $2);
 			#print STDERR "key: $key val: \"$val\"\n";
-			$s{$key} = join(":", split(/[ \t]+/, $val));
+			$delimitedScores{$key} = join(":", split(/[ \t]+/, $val));
 		}
 	}
 	close(SC);
@@ -140,8 +144,8 @@ if (-r $cache && open(SC, "<$cache")) {
 			$score .= ".0" unless $score =~ /\.[0-9]/;
 			$extra = '';
 			if ($extrainfo =~ /([-+])$/) {$extra = $1};
-			if (defined($s{$sid})) {
-				@scores = split(':', $s{$sid});
+			if (defined($delimitedScores{$sid})) {
+				@scores = split(':', $delimitedScores{$sid});
 			} else {
 				@scores = @NAscores;
 			}
@@ -185,17 +189,17 @@ if (-r $cache && open(SC, "<$cache")) {
 					$scores[$i] = $score;
 					$extras[$i] = $extra;
 					$t{$sid} = join(':', @times);
-					$s{$sid} = join(':', @scores);
+					$delimitedScores{$sid} = join(':', @scores);
 					$e{$sid} = join(':', @extras);
 				}
 				undef @times;
 				undef @extras;
 			} else {
 				$scores[$i] = $score;
-				$s{$sid} = join(':', @scores);
+				$delimitedScores{$sid} = join(':', @scores);
 			}
 			undef @scores;
-			#print STDERR "scores.dat: s{$sid} = $s{$sid}\n";
+			#print STDERR "scores.dat: s{$sid} = $delimitedScores{$sid}\n";
 		}
 		dbmclose(DB);
 		undef %DB;
@@ -275,22 +279,23 @@ foreach $dbfile (@sortedtdbs) {
 print "\n";
 
 # Data
-foreach $key (sort {$a <=> $b} (keys %s)) {
-	$value = $s{$key};
+foreach $key (sort {$a <=> $b} (keys %delimitedScores)) {
+	$value = $delimitedScores{$key};
+	$digest = $digests{$key};
 	$subs = 0; $output = '';
 	# Enter the SID into the first column
 	if ($showsids) {
 		#$output = sprintf ("%9.9s\t%24s", $key, $email);
 		$digest = $digests{$key};
-		$output = sprintf ("%s", $digest);
+		$output = sprintf("%s", $digest);
 	}
 	foreach $score (split(":", $value)) {
 		$output .= sprintf(" %6.6s", $score);
 		if ($score =~ /\d/) { $subs++;}
 	}
-	if (defined($txt{$key})) {
-		@tscores = split(':', $txt{$key});
-		$txt{$key} = ''; # undef; use only once to check for extras
+	if (defined($txt{$digest})) {
+		@tscores = split(':', $txt{$digest});
+		$txt{$digest} = ''; # undef; use only once to check for extras
 	} else {
 		@tscores = @NAscores;
 	}
